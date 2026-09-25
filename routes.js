@@ -1,15 +1,13 @@
 /**
  * SMMARIA NOTIFICATIONS — API Routes
  *
- * All endpoints in a single file as instructed.
- *
  * PUBLIC:
  *   GET  /api/health
  *   GET  /api/config
- *   POST /api/subscribe          (requires SMMARIA JWT)
- *   POST /api/unsubscribe       (requires SMMARIA JWT)
- *   GET  /api/subscription/status (requires SMMARIA JWT)
- *   POST /api/analytics/click    (rate-limited, validated)
+ *   POST /api/subscribe            (JWT optional — anonymous OK)
+ *   POST /api/unsubscribe           (JWT optional — anonymous OK)
+ *   GET  /api/subscription/status   (JWT optional — anonymous OK)
+ *   POST /api/analytics/click       (rate-limited, validated)
  *
  * ADMIN (requires x-admin-key header):
  *   GET  /api/admin/stats
@@ -78,10 +76,10 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ── User Identity Verification (JWT) ────────────────────────────
+// ── User Identity Verification (JWT) — STRICT ───────────────────
+// Used for admin-only user-specific operations.
 
 function verifyUser(req, res, next) {
-  // Development mode: allow user ID from header (TESTING ONLY)
   if (DEV_MODE) {
     const userId = req.headers['x-user-id'] || (req.body && req.body.userId);
     if (!userId) {
@@ -94,7 +92,6 @@ function verifyUser(req, res, next) {
     return next();
   }
 
-  // Production: verify SMMARIA JWT
   if (!JWT_SECRET) {
     return res.status(500).json({
       success: false,
@@ -130,6 +127,43 @@ function verifyUser(req, res, next) {
   }
 }
 
+// ── Optional User Verification — ALLOWS ANONYMOUS ───────────────
+// Same as verifyUser but does NOT fail if no token is present.
+// If JWT is valid → req.userId is set to the real user ID.
+// If no JWT or invalid JWT → req.userId is null (anonymous).
+// Used for subscribe / unsubscribe / subscription status.
+
+function optionalVerifyUser(req, res, next) {
+  if (DEV_MODE) {
+    req.userId = req.headers['x-user-id'] || (req.body && req.body.userId) || null;
+    return next();
+  }
+
+  if (!JWT_SECRET) {
+    // No JWT secret configured — allow anonymous (no userId)
+    req.userId = null;
+    return next();
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    // No token — anonymous user
+    req.userId = null;
+    return next();
+  }
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = decoded[JWT_USER_ID_CLAIM] || decoded.sub || decoded.id || decoded.userId;
+    req.userId = userId ? String(userId) : null;
+  } catch (err) {
+    // Invalid or expired token — treat as anonymous, do NOT reject
+    req.userId = null;
+  }
+  next();
+}
+
 // ── URL Validation ───────────────────────────────────────────────
 
 function isValidUrl(url) {
@@ -153,6 +187,15 @@ function dbOrError(res) {
     return null;
   }
   return getDb();
+}
+
+// ── Helper: check if a user is subscribed ────────────────────────
+
+async function isUserSubscribed(userId) {
+  if (!isAvailable()) return false;
+  const db = getDb();
+  const snap = await db.ref('notificationUsers/' + userId + '/subscribed').once('value');
+  return snap.val() === true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -180,9 +223,9 @@ router.get('/api/config', (req, res) => {
   });
 });
 
-// ── POST /api/subscribe ─────────────────────────────────────────
+// ── POST /api/subscribe (anonymous + authenticated) ────────────
 
-router.post('/api/subscribe', verifyUser, async (req, res) => {
+router.post('/api/subscribe', optionalVerifyUser, async (req, res) => {
   try {
     const { subscription, device } = req.body;
 
@@ -196,9 +239,6 @@ router.post('/api/subscribe', verifyUser, async (req, res) => {
     const db = dbOrError(res);
     if (!db) return;
 
-    const userId = req.userId;
-    const now = Date.now();
-
     // Generate a stable subscription ID from the endpoint hash
     const crypto = require('crypto');
     const subId = crypto
@@ -207,8 +247,14 @@ router.post('/api/subscribe', verifyUser, async (req, res) => {
       .digest('hex')
       .slice(0, 24);
 
-    const userRef = db.ref(`notificationUsers/${userId}`);
-    const subRef = userRef.child(`subscriptions/${subId}`);
+    // If user is authenticated (has valid JWT), use their userId.
+    // If anonymous (no JWT), use anonymous_{subId} as the identifier.
+    const userId = req.userId || ('anonymous_' + subId);
+    const isAnonymous = !req.userId;
+    const now = Date.now();
+
+    const userRef = db.ref('notificationUsers/' + userId);
+    const subRef = userRef.child('subscriptions/' + subId);
 
     // Save the subscription
     await subRef.set({
@@ -230,8 +276,9 @@ router.post('/api/subscribe', verifyUser, async (req, res) => {
     const userSnap = await userRef.once('value');
     if (!userSnap.exists() || !userSnap.val().createdAt) {
       await userRef.update({
-        userId,
+        userId: userId,
         subscribed: true,
+        isAnonymous: isAnonymous,
         createdAt: now,
         updatedAt: now,
         lastSeenAt: now
@@ -239,6 +286,7 @@ router.post('/api/subscribe', verifyUser, async (req, res) => {
     } else {
       await userRef.update({
         subscribed: true,
+        isAnonymous: isAnonymous,
         updatedAt: now,
         lastSeenAt: now
       });
@@ -247,7 +295,8 @@ router.post('/api/subscribe', verifyUser, async (req, res) => {
     res.json({
       success: true,
       message: 'Subscription saved successfully',
-      subscriptionId: subId
+      subscriptionId: subId,
+      anonymous: isAnonymous
     });
   } catch (error) {
     console.error('[subscribe] Error:', error.message);
@@ -258,9 +307,9 @@ router.post('/api/subscribe', verifyUser, async (req, res) => {
   }
 });
 
-// ── POST /api/unsubscribe ───────────────────────────────────────
+// ── POST /api/unsubscribe (anonymous + authenticated) ───────────
 
-router.post('/api/unsubscribe', verifyUser, async (req, res) => {
+router.post('/api/unsubscribe', optionalVerifyUser, async (req, res) => {
   try {
     const { endpoint } = req.body;
 
@@ -274,39 +323,93 @@ router.post('/api/unsubscribe', verifyUser, async (req, res) => {
     const db = dbOrError(res);
     if (!db) return;
 
-    const userId = req.userId;
-    const userRef = db.ref(`notificationUsers/${userId}`);
-    const subsSnap = await userRef.child('subscriptions').once('value');
-    const subs = subsSnap.val() || {};
+    const crypto = require('crypto');
+    const subId = crypto
+      .createHash('sha256')
+      .update(endpoint)
+      .digest('hex')
+      .slice(0, 24);
 
     let removed = false;
 
-    for (const [subId, sub] of Object.entries(subs)) {
-      if (sub.endpoint === endpoint) {
-        await userRef.child(`subscriptions/${subId}`).update({
+    if (req.userId) {
+      // ── Authenticated user — remove from their subscriptions ──
+      const userRef = db.ref('notificationUsers/' + req.userId);
+      const subsSnap = await userRef.child('subscriptions').once('value');
+      const subs = subsSnap.val() || {};
+
+      for (const [sid, sub] of Object.entries(subs)) {
+        if (sub.endpoint === endpoint) {
+          await userRef.child('subscriptions/' + sid).update({
+            active: false,
+            updatedAt: Date.now()
+          });
+          removed = true;
+          break;
+        }
+      }
+
+      if (removed) {
+        const refreshedSnap = await userRef.child('subscriptions').once('value');
+        const refreshedSubs = refreshedSnap.val() || {};
+        const hasActive = Object.values(refreshedSubs).some(s => s.active === true);
+        await userRef.update({
+          subscribed: hasActive,
+          updatedAt: Date.now()
+        });
+      }
+    } else {
+      // ── Anonymous user — find by endpoint hash ──
+      const anonRef = db.ref('notificationUsers/anonymous_' + subId);
+      const anonSnap = await anonRef.once('value');
+
+      if (anonSnap.exists()) {
+        await anonRef.child('subscriptions/' + subId).update({
           active: false,
           updatedAt: Date.now()
         });
         removed = true;
-        break;
-      }
-    }
 
-    // Refresh subscribed flag
-    if (removed) {
-      const refreshedSnap = await userRef.child('subscriptions').once('value');
-      const refreshedSubs = refreshedSnap.val() || {};
-      const hasActive = Object.values(refreshedSubs).some(s => s.active === true);
-      await userRef.update({
-        subscribed: hasActive,
-        updatedAt: Date.now()
-      });
+        const refreshedSnap = await anonRef.child('subscriptions').once('value');
+        const refreshedSubs = refreshedSnap.val() || {};
+        const hasActive = Object.values(refreshedSubs).some(s => s.active === true);
+        await anonRef.update({
+          subscribed: hasActive,
+          updatedAt: Date.now()
+        });
+      } else {
+        // Safety net — search all users for this endpoint
+        const allUsersSnap = await db.ref('notificationUsers').once('value');
+        const allUsers = allUsersSnap.val() || {};
+
+        outer:
+        for (const [uid, udata] of Object.entries(allUsers)) {
+          const subs = udata.subscriptions || {};
+          for (const [sid, sub] of Object.entries(subs)) {
+            if (sub.endpoint === endpoint && sub.active) {
+              await db.ref('notificationUsers/' + uid + '/subscriptions/' + sid).update({
+                active: false,
+                updatedAt: Date.now()
+              });
+              removed = true;
+
+              const refSnap = await db.ref('notificationUsers/' + uid + '/subscriptions').once('value');
+              const refSubs = refSnap.val() || {};
+              const hasAct = Object.values(refSubs).some(s => s.active === true);
+              await db.ref('notificationUsers/' + uid).update({
+                subscribed: hasAct,
+                updatedAt: Date.now()
+              });
+              break outer;
+            }
+          }
+        }
+      }
     }
 
     res.json({
       success: true,
-      message: removed ? 'Subscription removed' : 'Subscription not found',
-      subscribed: removed ? await isUserSubscribed(userId) : null
+      message: removed ? 'Subscription removed' : 'Subscription not found'
     });
   } catch (error) {
     console.error('[unsubscribe] Error:', error.message);
@@ -317,10 +420,20 @@ router.post('/api/unsubscribe', verifyUser, async (req, res) => {
   }
 });
 
-// ── GET /api/subscription/status ────────────────────────────────
+// ── GET /api/subscription/status (anonymous + authenticated) ───
 
-router.get('/api/subscription/status', verifyUser, async (req, res) => {
+router.get('/api/subscription/status', optionalVerifyUser, async (req, res) => {
   try {
+    // If user is not authenticated, return subscribed: false.
+    // The client checks locally via pushManager.getSubscription()
+    // for anonymous users — this is the correct behavior.
+    if (!req.userId) {
+      return res.json({
+        success: true,
+        subscribed: false
+      });
+    }
+
     const db = dbOrError(res);
     if (!db) return;
 
@@ -339,20 +452,12 @@ router.get('/api/subscription/status', verifyUser, async (req, res) => {
   }
 });
 
-async function isUserSubscribed(userId) {
-  if (!isAvailable()) return false;
-  const db = getDb();
-  const snap = await db.ref(`notificationUsers/${userId}/subscribed`).once('value');
-  return snap.val() === true;
-}
-
 // ── POST /api/analytics/click ────────────────────────────────────
 
 router.post('/api/analytics/click', async (req, res) => {
   try {
     const { notificationId, event, action } = req.body;
 
-    // Validate event type
     const validEvents = ['notification_click', 'action_click'];
     if (!validEvents.includes(event)) {
       return res.status(400).json({
@@ -372,7 +477,7 @@ router.post('/api/analytics/click', async (req, res) => {
     if (!db) return;
 
     // Verify the notification exists
-    const notifSnap = await db.ref(`notifications/${notificationId}`).once('value');
+    const notifSnap = await db.ref('notifications/' + notificationId).once('value');
     if (!notifSnap.exists()) {
       return res.status(404).json({
         success: false,
@@ -380,9 +485,9 @@ router.post('/api/analytics/click', async (req, res) => {
       });
     }
 
-    // Rate limit by IP: max 10 clicks per minute per IP
+    // Rate limit by IP
     const ip = req.ip || req.connection.remoteAddress || 'unknown';
-    const rateKey = `click:${ip}`;
+    const rateKey = 'click:' + ip;
     if (!rateLimit(rateKey, 10, 60000)) {
       return res.status(429).json({
         success: false,
@@ -390,9 +495,9 @@ router.post('/api/analytics/click', async (req, res) => {
       });
     }
 
-    // Record the event for idempotency / audit
-    const eventId = `${notificationId}_${ip}_${event}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    await db.ref(`notificationEvents/${eventId}`).set({
+    // Record the event
+    const eventId = notificationId + '_' + ip + '_' + event + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    await db.ref('notificationEvents/' + eventId).set({
       notificationId,
       event,
       action: action || null,
@@ -400,7 +505,6 @@ router.post('/api/analytics/click', async (req, res) => {
       createdAt: Date.now()
     });
 
-    // Increment counters
     await push.incrementClick(notificationId, event);
 
     res.json({
@@ -487,6 +591,7 @@ router.get('/api/admin/users', requireAdmin, async (req, res) => {
       return {
         userId,
         subscribed: data.subscribed || false,
+        isAnonymous: data.isAnonymous || false,
         deviceCount: activeSubs.length,
         lastSeenAt: data.lastSeenAt || data.updatedAt || null,
         createdAt: data.createdAt || null,
@@ -572,7 +677,6 @@ router.post('/api/admin/send', requireAdmin, async (req, res) => {
       audience
     } = req.body;
 
-    // Validate required fields
     if (!title || !body) {
       return res.status(400).json({
         success: false,
@@ -587,7 +691,6 @@ router.post('/api/admin/send', requireAdmin, async (req, res) => {
       });
     }
 
-    // Validate URLs if provided
     if (imageUrl && !isValidUrl(imageUrl)) {
       return res.status(400).json({ success: false, message: 'Invalid image URL' });
     }
@@ -601,7 +704,7 @@ router.post('/api/admin/send', requireAdmin, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid destination URL' });
     }
 
-    const notificationId = `notif_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const notificationId = 'notif_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const now = Date.now();
 
     const notification = {
@@ -625,13 +728,10 @@ router.post('/api/admin/send', requireAdmin, async (req, res) => {
       actionClickCount: 0
     };
 
-    // Save notification to Firebase
     await push.saveNotification(notification);
 
-    // Broadcast to all subscribers
     const stats = await push.broadcast(notification);
 
-    // Update stats
     await push.updateNotificationStats(notificationId, stats);
 
     res.json({
@@ -689,7 +789,7 @@ router.post('/api/admin/send-user', requireAdmin, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid destination URL' });
     }
 
-    const notificationId = `notif_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const notificationId = 'notif_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const now = Date.now();
 
     const notification = {
@@ -743,7 +843,7 @@ router.get('/api/admin/analytics/:notificationId', requireAdmin, async (req, res
     const db = dbOrError(res);
     if (!db) return;
 
-    const notifSnap = await db.ref(`notifications/${notificationId}`).once('value');
+    const notifSnap = await db.ref('notifications/' + notificationId).once('value');
     if (!notifSnap.exists()) {
       return res.status(404).json({
         success: false,
@@ -751,7 +851,7 @@ router.get('/api/admin/analytics/:notificationId', requireAdmin, async (req, res
       });
     }
 
-    const analyticsSnap = await db.ref(`notificationAnalytics/${notificationId}`).once('value');
+    const analyticsSnap = await db.ref('notificationAnalytics/' + notificationId).once('value');
     const analytics = analyticsSnap.val() || {};
 
     const notif = notifSnap.val();
