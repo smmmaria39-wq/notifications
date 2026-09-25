@@ -4,10 +4,16 @@
  * PUBLIC:
  *   GET  /api/health
  *   GET  /api/config
- *   POST /api/subscribe            (JWT optional — anonymous OK)
+ *   POST /api/subscribe             (JWT optional — anonymous OK)
  *   POST /api/unsubscribe           (JWT optional — anonymous OK)
  *   GET  /api/subscription/status   (JWT optional — anonymous OK)
  *   POST /api/analytics/click       (rate-limited, validated)
+ *
+ * IN-APP (for iPhone/iOS + all browsers — no Web Push needed):
+ *   POST /api/in-app/subscribe
+ *   GET  /api/in-app/notifications?visitorId=xxx
+ *   POST /api/in-app/dismiss
+ *   GET  /api/in-app/status?visitorId=xxx
  *
  * ADMIN (requires x-admin-key header):
  *   GET  /api/admin/stats
@@ -47,7 +53,6 @@ function rateLimit(key, max, windowMs) {
   return true;
 }
 
-// Clean up old entries every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [k, entries] of rateLimitMap.entries()) {
@@ -77,7 +82,6 @@ function requireAdmin(req, res, next) {
 }
 
 // ── User Identity Verification (JWT) — STRICT ───────────────────
-// Used for admin-only user-specific operations.
 
 function verifyUser(req, res, next) {
   if (DEV_MODE) {
@@ -128,10 +132,6 @@ function verifyUser(req, res, next) {
 }
 
 // ── Optional User Verification — ALLOWS ANONYMOUS ───────────────
-// Same as verifyUser but does NOT fail if no token is present.
-// If JWT is valid → req.userId is set to the real user ID.
-// If no JWT or invalid JWT → req.userId is null (anonymous).
-// Used for subscribe / unsubscribe / subscription status.
 
 function optionalVerifyUser(req, res, next) {
   if (DEV_MODE) {
@@ -140,14 +140,12 @@ function optionalVerifyUser(req, res, next) {
   }
 
   if (!JWT_SECRET) {
-    // No JWT secret configured — allow anonymous (no userId)
     req.userId = null;
     return next();
   }
 
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    // No token — anonymous user
     req.userId = null;
     return next();
   }
@@ -158,7 +156,6 @@ function optionalVerifyUser(req, res, next) {
     const userId = decoded[JWT_USER_ID_CLAIM] || decoded.sub || decoded.id || decoded.userId;
     req.userId = userId ? String(userId) : null;
   } catch (err) {
-    // Invalid or expired token — treat as anonymous, do NOT reject
     req.userId = null;
   }
   next();
@@ -239,7 +236,6 @@ router.post('/api/subscribe', optionalVerifyUser, async (req, res) => {
     const db = dbOrError(res);
     if (!db) return;
 
-    // Generate a stable subscription ID from the endpoint hash
     const crypto = require('crypto');
     const subId = crypto
       .createHash('sha256')
@@ -247,8 +243,6 @@ router.post('/api/subscribe', optionalVerifyUser, async (req, res) => {
       .digest('hex')
       .slice(0, 24);
 
-    // If user is authenticated (has valid JWT), use their userId.
-    // If anonymous (no JWT), use anonymous_{subId} as the identifier.
     const userId = req.userId || ('anonymous_' + subId);
     const isAnonymous = !req.userId;
     const now = Date.now();
@@ -256,7 +250,6 @@ router.post('/api/subscribe', optionalVerifyUser, async (req, res) => {
     const userRef = db.ref('notificationUsers/' + userId);
     const subRef = userRef.child('subscriptions/' + subId);
 
-    // Save the subscription
     await subRef.set({
       endpoint: subscription.endpoint,
       expirationTime: subscription.expirationTime || null,
@@ -272,7 +265,6 @@ router.post('/api/subscribe', optionalVerifyUser, async (req, res) => {
       updatedAt: now
     });
 
-    // Ensure user-level fields exist
     const userSnap = await userRef.once('value');
     if (!userSnap.exists() || !userSnap.val().createdAt) {
       await userRef.update({
@@ -333,7 +325,6 @@ router.post('/api/unsubscribe', optionalVerifyUser, async (req, res) => {
     let removed = false;
 
     if (req.userId) {
-      // ── Authenticated user — remove from their subscriptions ──
       const userRef = db.ref('notificationUsers/' + req.userId);
       const subsSnap = await userRef.child('subscriptions').once('value');
       const subs = subsSnap.val() || {};
@@ -359,7 +350,6 @@ router.post('/api/unsubscribe', optionalVerifyUser, async (req, res) => {
         });
       }
     } else {
-      // ── Anonymous user — find by endpoint hash ──
       const anonRef = db.ref('notificationUsers/anonymous_' + subId);
       const anonSnap = await anonRef.once('value');
 
@@ -378,7 +368,6 @@ router.post('/api/unsubscribe', optionalVerifyUser, async (req, res) => {
           updatedAt: Date.now()
         });
       } else {
-        // Safety net — search all users for this endpoint
         const allUsersSnap = await db.ref('notificationUsers').once('value');
         const allUsers = allUsersSnap.val() || {};
 
@@ -424,9 +413,6 @@ router.post('/api/unsubscribe', optionalVerifyUser, async (req, res) => {
 
 router.get('/api/subscription/status', optionalVerifyUser, async (req, res) => {
   try {
-    // If user is not authenticated, return subscribed: false.
-    // The client checks locally via pushManager.getSubscription()
-    // for anonymous users — this is the correct behavior.
     if (!req.userId) {
       return res.json({
         success: true,
@@ -476,7 +462,6 @@ router.post('/api/analytics/click', async (req, res) => {
     const db = dbOrError(res);
     if (!db) return;
 
-    // Verify the notification exists
     const notifSnap = await db.ref('notifications/' + notificationId).once('value');
     if (!notifSnap.exists()) {
       return res.status(404).json({
@@ -485,7 +470,6 @@ router.post('/api/analytics/click', async (req, res) => {
       });
     }
 
-    // Rate limit by IP
     const ip = req.ip || req.connection.remoteAddress || 'unknown';
     const rateKey = 'click:' + ip;
     if (!rateLimit(rateKey, 10, 60000)) {
@@ -495,7 +479,6 @@ router.post('/api/analytics/click', async (req, res) => {
       });
     }
 
-    // Record the event
     const eventId = notificationId + '_' + ip + '_' + event + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     await db.ref('notificationEvents/' + eventId).set({
       notificationId,
@@ -521,6 +504,230 @@ router.post('/api/analytics/click', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+//  IN-APP NOTIFICATION ROUTES
+//  For iPhone/iOS Safari + ALL browsers that can't use Web Push.
+//  Users see notification popup cards when they visit the website.
+//  Does NOT use Web Push — fetches notifications on page load.
+// ═══════════════════════════════════════════════════════════════
+
+// ── POST /api/in-app/subscribe ──────────────────────────────────
+// Saves a visitor as an in-app-only subscriber (no PushSubscription).
+// Used for iPhone/iOS Safari and any browser without push support.
+
+router.post('/api/in-app/subscribe', async (req, res) => {
+  try {
+    const { visitorId, device } = req.body;
+
+    if (!visitorId) {
+      return res.status(400).json({
+        success: false,
+        message: 'visitorId is required'
+      });
+    }
+
+    const db = dbOrError(res);
+    if (!db) return;
+
+    const now = Date.now();
+    const userRef = db.ref('notificationUsers/' + visitorId);
+
+    const existingSnap = await userRef.once('value');
+    if (!existingSnap.exists()) {
+      await userRef.set({
+        userId: visitorId,
+        subscribed: true,
+        deliveryMethod: 'in-app',
+        isAnonymous: true,
+        createdAt: now,
+        updatedAt: now,
+        lastSeenAt: now
+      });
+    } else {
+      await userRef.update({
+        subscribed: true,
+        deliveryMethod: 'in-app',
+        updatedAt: now,
+        lastSeenAt: now
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'In-app subscription saved'
+    });
+  } catch (error) {
+    console.error('[in-app/subscribe] Error:', error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to save in-app subscription'
+    });
+  }
+});
+
+// ── GET /api/in-app/notifications?visitorId=xxx ─────────────────
+// Returns unread notifications for this visitor.
+// Unread = created after lastSeenAt AND not dismissed.
+
+router.get('/api/in-app/notifications', async (req, res) => {
+  try {
+    const visitorId = req.query.visitorId;
+
+    if (!visitorId) {
+      return res.status(400).json({
+        success: false,
+        message: 'visitorId query parameter is required'
+      });
+    }
+
+    const db = dbOrError(res);
+    if (!db) return;
+
+    // Check if visitor is subscribed
+    const userSnap = await db.ref('notificationUsers/' + visitorId).once('value');
+    if (!userSnap.exists() || !userSnap.val().subscribed) {
+      return res.json({
+        success: true,
+        notifications: []
+      });
+    }
+
+    const userData = userSnap.val();
+    const lastSeenAt = userData.lastSeenAt || 0;
+    const now = Date.now();
+
+    // Update lastSeenAt immediately
+    await db.ref('notificationUsers/' + visitorId).update({
+      lastSeenAt: now
+    });
+
+    // Get all notifications created after lastSeenAt
+    const notifsSnap = await db.ref('notifications')
+      .orderByChild('createdAt')
+      .startAt(lastSeenAt + 1)
+      .once('value');
+
+    const allNotifs = notifsSnap.val() || {};
+
+    // Get dismissed notifications for this visitor
+    const dismissedSnap = await db.ref('notificationDismissals/' + visitorId).once('value');
+    const dismissed = dismissedSnap.val() || {};
+
+    // Filter out dismissed and future-dated notifications
+    const unreadNotifs = Object.entries(allNotifs)
+      .filter(function (entry) {
+        var created = (entry[1] && entry[1].createdAt) || 0;
+        return created <= now && !dismissed[entry[0]];
+      })
+      .map(function (entry) {
+        var id = entry[0];
+        var data = entry[1] || {};
+        return {
+          id: id,
+          title: data.title || 'SMMARIA',
+          body: data.body || '',
+          type: data.type || 'general',
+          imageUrl: data.imageUrl || null,
+          iconUrl: data.iconUrl || null,
+          actionText: data.actionText || null,
+          destinationUrl: data.destinationUrl || 'https://smmaria.site',
+          createdAt: data.createdAt || 0
+        };
+      })
+      .sort(function (a, b) {
+        return (b.createdAt || 0) - (a.createdAt || 0);
+      })
+      .slice(0, 5); // Max 5 at a time
+
+    res.json({
+      success: true,
+      notifications: unreadNotifs
+    });
+  } catch (error) {
+    console.error('[in-app/notifications] Error:', error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to fetch notifications'
+    });
+  }
+});
+
+// ── POST /api/in-app/dismiss ────────────────────────────────────
+// Marks a notification as dismissed for this visitor.
+
+router.post('/api/in-app/dismiss', async (req, res) => {
+  try {
+    const { visitorId, notificationId } = req.body;
+
+    if (!visitorId || !notificationId) {
+      return res.status(400).json({
+        success: false,
+        message: 'visitorId and notificationId are required'
+      });
+    }
+
+    const db = dbOrError(res);
+    if (!db) return;
+
+    // Verify the notification exists
+    const notifSnap = await db.ref('notifications/' + notificationId).once('value');
+    if (!notifSnap.exists()) {
+      return res.status(404).json({
+        success: false,
+        message: 'Notification not found'
+      });
+    }
+
+    // Save the dismissal
+    await db.ref('notificationDismissals/' + visitorId + '/' + notificationId).set({
+      dismissedAt: Date.now()
+    });
+
+    res.json({
+      success: true,
+      message: 'Notification dismissed'
+    });
+  } catch (error) {
+    console.error('[in-app/dismiss] Error:', error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to dismiss notification'
+    });
+  }
+});
+
+// ── GET /api/in-app/status?visitorId=xxx ───────────────────────
+// Checks if a visitor is subscribed to in-app notifications.
+
+router.get('/api/in-app/status', async (req, res) => {
+  try {
+    const visitorId = req.query.visitorId;
+
+    if (!visitorId) {
+      return res.json({
+        success: true,
+        subscribed: false
+      });
+    }
+
+    const db = dbOrError(res);
+    if (!db) return;
+
+    const snap = await db.ref('notificationUsers/' + visitorId + '/subscribed').once('value');
+
+    res.json({
+      success: true,
+      subscribed: snap.val() === true
+    });
+  } catch (error) {
+    console.error('[in-app/status] Error:', error.message);
+    res.json({
+      success: true,
+      subscribed: false
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 //  ADMIN ROUTES (all require x-admin-key header)
 // ═══════════════════════════════════════════════════════════════
 
@@ -536,9 +743,13 @@ router.get('/api/admin/stats', requireAdmin, async (req, res) => {
 
     let subscribedUsers = 0;
     let activeDevices = 0;
+    let inAppSubscribers = 0;
+    let pushSubscribers = 0;
 
     for (const userData of Object.values(users)) {
       if (userData.subscribed) subscribedUsers++;
+      if (userData.deliveryMethod === 'in-app') inAppSubscribers++;
+      else pushSubscribers++;
       const subs = userData.subscriptions || {};
       for (const sub of Object.values(subs)) {
         if (sub.active) activeDevices++;
@@ -559,6 +770,8 @@ router.get('/api/admin/stats', requireAdmin, async (req, res) => {
       stats: {
         subscribedUsers,
         activeDevices,
+        inAppSubscribers,
+        pushSubscribers,
         notificationsSent: notifList.length,
         totalSendAttempts: totalSent,
         totalFailedSends: totalFailed,
@@ -592,6 +805,7 @@ router.get('/api/admin/users', requireAdmin, async (req, res) => {
         userId,
         subscribed: data.subscribed || false,
         isAnonymous: data.isAnonymous || false,
+        deliveryMethod: data.deliveryMethod || 'push',
         deviceCount: activeSubs.length,
         lastSeenAt: data.lastSeenAt || data.updatedAt || null,
         createdAt: data.createdAt || null,
@@ -666,15 +880,8 @@ router.get('/api/admin/notifications', requireAdmin, async (req, res) => {
 router.post('/api/admin/send', requireAdmin, async (req, res) => {
   try {
     const {
-      title,
-      body,
-      imageUrl,
-      iconUrl,
-      badgeUrl,
-      actionText,
-      destinationUrl,
-      type,
-      audience
+      title, body, imageUrl, iconUrl, badgeUrl,
+      actionText, destinationUrl, type, audience
     } = req.body;
 
     if (!title || !body) {
@@ -709,8 +916,7 @@ router.post('/api/admin/send', requireAdmin, async (req, res) => {
 
     const notification = {
       id: notificationId,
-      title,
-      body,
+      title, body,
       type: type || 'general',
       imageUrl: imageUrl || null,
       iconUrl: iconUrl || null,
@@ -729,9 +935,7 @@ router.post('/api/admin/send', requireAdmin, async (req, res) => {
     };
 
     await push.saveNotification(notification);
-
     const stats = await push.broadcast(notification);
-
     await push.updateNotificationStats(notificationId, stats);
 
     res.json({
@@ -754,15 +958,8 @@ router.post('/api/admin/send', requireAdmin, async (req, res) => {
 router.post('/api/admin/send-user', requireAdmin, async (req, res) => {
   try {
     const {
-      title,
-      body,
-      imageUrl,
-      iconUrl,
-      badgeUrl,
-      actionText,
-      destinationUrl,
-      type,
-      targetUserId
+      title, body, imageUrl, iconUrl, badgeUrl,
+      actionText, destinationUrl, type, targetUserId
     } = req.body;
 
     if (!title || !body) {
@@ -794,8 +991,7 @@ router.post('/api/admin/send-user', requireAdmin, async (req, res) => {
 
     const notification = {
       id: notificationId,
-      title,
-      body,
+      title, body,
       type: type || 'general',
       imageUrl: imageUrl || null,
       iconUrl: iconUrl || null,
@@ -815,9 +1011,7 @@ router.post('/api/admin/send-user', requireAdmin, async (req, res) => {
     };
 
     await push.saveNotification(notification);
-
     const stats = await push.sendToUser(targetUserId, notification);
-
     await push.updateNotificationStats(notificationId, stats);
 
     res.json({
@@ -853,7 +1047,6 @@ router.get('/api/admin/analytics/:notificationId', requireAdmin, async (req, res
 
     const analyticsSnap = await db.ref('notificationAnalytics/' + notificationId).once('value');
     const analytics = analyticsSnap.val() || {};
-
     const notif = notifSnap.val();
 
     res.json({
