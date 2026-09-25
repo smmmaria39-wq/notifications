@@ -1,0 +1,19 @@
+{
+ "name": "smmaria-notifications",
+ "version": "1.0.0",
+ "description": "Standalone Web Push Notification System for SMMARIA PANEL",
+ "main": "server.js",
+ "scripts": {
+  "start": "node server.js"
+ },
+ "engines": {
+  "node": ">=18"
+ },
+ "dependencies": {
+  "cors": "^2.8.5",
+  "express": "^4.19.2",
+  "firebase-admin": "^12.4.0",
+  "jsonwebtoken": "^9.0.2",
+  "web-push": "^3.6.7"
+ }
+}
